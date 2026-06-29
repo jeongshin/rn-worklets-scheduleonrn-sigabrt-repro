@@ -1,205 +1,343 @@
 /**
- * Minimal reproduction for reanimated 4.5.0 + react-native-svg crash on RN 0.86 Android.
+ * Reproduction: SIGABRT in mqt_v_js when `scheduleOnRN` is called from inside
+ * a `withTiming` completion callback under concurrent Skia animation load.
  *
- * Pattern (extracted from a real app's episode-player screen):
- *  - An <Animated.View> with useAnimatedStyle (opacity + translateY) driven by withTiming.
- *  - Inside it: multiple <SvgXml> children from react-native-svg (icons + tooltip arrow).
- *  - Sibling: a Skia <Canvas> (gradient shadow) that releases its SurfaceTexture on unmount.
- *  - Rapid toggle that mounts/unmounts the whole subtree while withTiming is in flight.
+ *   jsi.h:2014: Object facebook::jsi::Value::getObject(IRuntime &) &&:
+ *               assertion "isObject()" failed
+ *   Fatal signal 6 (SIGABRT) in tid mqt_v_js
+ *   backtrace: libworklets.so → Value::getObject
+ *              → CallInvoker::invokeAsync lambda
+ *              → RuntimeScheduler_Modern → JNativeRunnable::run()
  *
- * Repeatedly toggling produces the per-frame swallowed exception
- * `synchronouslyUpdateUIProps failed for tag <N>` (RetryableMountingLayerException:
- * Unable to find SurfaceMountingManager for tag) and after a few seconds the app
- * aborts in libworklets.so with `jsi.h:2014: assertion "isObject()" failed`.
+ * Buggy pattern (three concurrent instances):
  *
- * See https://github.com/software-mansion/react-native-reanimated/issues/9681
- * and PR https://github.com/software-mansion/react-native-reanimated/pull/9694
- * (the swallowed exception loop the present issue is filed against).
+ *   opacity.value = withTiming(0, { duration: D }, finished => {
+ *     'worklet';
+ *     if (finished) scheduleOnRN(fn, arg);  // ← UAF: JSI ref freed after callback returns
+ *   });
+ *
+ * Fix: replace scheduleOnRN inside withTiming with a JS-side setTimeout.
  */
 
-import React, {useEffect, useState} from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import Animated, {
-  useAnimatedStyle,
+import { Canvas, Image as SkiaImage, Skia } from '@shopify/react-native-skia';
+import type { SkImage } from '@shopify/react-native-skia';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  cancelAnimation,
   useSharedValue,
   withTiming,
 } from 'react-native-reanimated';
-import {SvgXml} from 'react-native-svg';
-import {Canvas, Rect} from '@shopify/react-native-skia';
+import { scheduleOnRN } from 'react-native-worklets';
 
-const ICON_XML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" fill="none">
-<g>
-<path d="M10 2 L12 8 L18 8 L13 12 L15 18 L10 14 L5 18 L7 12 L2 8 L8 8 Z" fill="#F5F5F6"/>
-</g>
-</svg>`;
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-const POLYGON_XML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="14" viewBox="0 0 20 14" fill="none">
-<path d="M8.37 0.93 C9.17 -0.31 10.83 -0.31 11.63 0.93 L20 14 H0 L8.37 0.93 Z" fill="#D9D9D9"/>
-<path d="M8.37 0.93 C9.17 -0.31 10.83 -0.31 11.63 0.93 L20 14 H0 L8.37 0.93 Z" fill="#16171A"/>
-</svg>`;
+const CROSSFADE_EXIT_DURATION_1 = 700; // mirrors useSkiaCrossfadeTransition
+const CROSSFADE_EXIT_DURATION_2 = 600; // mirrors CrossfadeImage
+const CROSSFADE_ENTER_DURATION = 400;
+const CROSSFADE_INTERVAL_MS = 1000; // > exit duration → animation always completes
 
-function ProblematicSubtree() {
-  const animation = useSharedValue(0);
+const CHAR_EXIT_DURATION = 700; // mirrors SharedCharacterAnimatedImageViewer
+const CHAR_CYCLE_MS = 800;
+const STAGGER_MS = 80;
+const CHARACTER_COUNT = 10; // × 2 layers = 20 total
 
-  useEffect(() => {
-    animation.value = withTiming(1, {duration: 150});
-  }, [animation]);
+const SCENE_INTERVAL_MS = 80;
 
-  const style = useAnimatedStyle(() => ({
-    opacity: animation.value,
-    transform: [{translateY: -(8 * (1 - animation.value))}],
-  }));
+// ─── Image loading ────────────────────────────────────────────────────────────
 
-  return (
-    <Animated.View style={[styles.tooltip, style]}>
-      <View style={styles.row}>
-        <SvgXml xml={ICON_XML} width={16} height={16} />
-        <Text style={styles.label}>music</Text>
-      </View>
-      <View style={styles.row}>
-        <SvgXml xml={ICON_XML} width={16} height={16} />
-        <Text style={styles.label}>audio</Text>
-      </View>
-      <View style={styles.row}>
-        <SvgXml xml={ICON_XML} width={16} height={16} />
-        <Text style={styles.label}>text</Text>
-      </View>
-      <View style={styles.polygon}>
-        <SvgXml xml={POLYGON_XML} width={20} height={14} />
-      </View>
-      {/* Skia Canvas sibling — releases SurfaceTexture on unmount, matching the
-          [SurfaceTexture] updateAndRelease message seen immediately before the
-          crash loop begins. */}
-      <View>
-        <Canvas style={styles.canvas}>
-          <Rect
-            x={0}
-            y={0}
-            width={200}
-            height={60}
-            color="black"
-            opacity={0.3}
-          />
-        </Canvas>
-      </View>
-    </Animated.View>
-  );
+const IMAGE_URLS = [
+  'https://dimg.donga.com/wps/NEWS/IMAGE/2026/03/05/133467661.1.jpg',
+  'https://cdn.nc.press/news/photo/202602/608852_817067_3346.jpg',
+];
+
+async function fetchSkiaImage(url: string): Promise<SkImage | null> {
+  try {
+    const res = await fetch(url);
+    const data = Skia.Data.fromBytes(new Uint8Array(await res.arrayBuffer()));
+    const img = Skia.Image.MakeImageFromEncoded(data);
+    data.dispose();
+    return img;
+  } catch {
+    return null;
+  }
 }
 
-function App() {
-  const [visible, setVisible] = useState(false);
-  const [autoToggleCount, setAutoToggleCount] = useState(0);
-  const [autoToggle, setAutoToggle] = useState(false);
+// ─── CrossfadeLayer — Pattern 1 and 2 ────────────────────────────────────────
+// Mirrors useSkiaCrossfadeTransition / CrossfadeImage (buggy version).
 
-  // Auto-toggle every 200ms — guarantees we are always mounting/unmounting
-  // while the previous withTiming(150ms) is in flight, creating the
-  // mount/unmount race window.
+interface CrossfadeLayerProps {
+  imageA: SkImage | null;
+  imageB: SkImage | null;
+  exitDuration: number;
+  label: string;
+}
+
+function CrossfadeLayer({
+  imageA,
+  imageB,
+  exitDuration,
+  label,
+}: CrossfadeLayerProps) {
+  const currentSlot = useRef<'A' | 'B'>('A');
+  const [slotA, setSlotA] = useState<SkImage | null>(imageA);
+  const [slotB, setSlotB] = useState<SkImage | null>(null);
+  const [cycle, setCycle] = useState(0);
+  const alphaA = useSharedValue(1);
+  const alphaB = useSharedValue(0);
+
   useEffect(() => {
-    if (!autoToggle) {
-      return;
+    const id = setInterval(() => setCycle(c => c + 1), CROSSFADE_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (cycle === 0) return;
+    const imgs = [imageA, imageB];
+    const next = imgs[cycle % imgs.length] ?? null;
+    const prev = currentSlot.current;
+    const nextSlot: 'A' | 'B' = prev === 'A' ? 'B' : 'A';
+    currentSlot.current = nextSlot;
+    cancelAnimation(alphaA);
+    cancelAnimation(alphaB);
+
+    if (nextSlot === 'A') {
+      setSlotA(next);
+      alphaA.value = withTiming(1, { duration: CROSSFADE_ENTER_DURATION });
+      alphaB.value = withTiming(0, { duration: exitDuration }, finished => {
+        'worklet';
+        if (finished) scheduleOnRN(setSlotB, null); // ← BUGGY
+      });
+    } else {
+      setSlotB(next);
+      alphaB.value = withTiming(1, { duration: CROSSFADE_ENTER_DURATION });
+      alphaA.value = withTiming(0, { duration: exitDuration }, finished => {
+        'worklet';
+        if (finished) scheduleOnRN(setSlotA, null); // ← BUGGY
+      });
     }
-    const interval = setInterval(() => {
-      setVisible(v => !v);
-      setAutoToggleCount(c => c + 1);
-    }, 200);
-    return () => clearInterval(interval);
-  }, [autoToggle]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cycle]);
 
+  const W = 120;
+  const H = 80;
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>
-        RN 0.86 + Reanimated 4.5.0 + react-native-svg crash repro
-      </Text>
-
-      <Pressable
-        style={styles.button}
-        onPress={() => setVisible(v => !v)}>
-        <Text style={styles.buttonText}>
-          Manual toggle (visible={String(visible)})
-        </Text>
-      </Pressable>
-
-      <Pressable
-        style={styles.button}
-        onPress={() => setAutoToggle(a => !a)}>
-        <Text style={styles.buttonText}>
-          Auto toggle 200ms (running={String(autoToggle)}, count=
-          {autoToggleCount})
-        </Text>
-      </Pressable>
-
-      <Text style={styles.hint}>
-        Tap "Auto toggle" to start the race. Within a few seconds on Android you
-        should see per-frame "synchronouslyUpdateUIProps failed for tag"
-        warnings in logcat, then SIGABRT with jsi.h "isObject()" assertion in
-        libworklets.so.
-      </Text>
-
-      <View style={styles.slot}>{visible ? <ProblematicSubtree /> : null}</View>
+    <View style={styles.crossfadeWrap}>
+      <Text style={styles.label}>{label}</Text>
+      <View style={{ width: W, height: H }}>
+        <Canvas style={StyleSheet.absoluteFill}>
+          {slotA ? (
+            <SkiaImage
+              image={slotA}
+              x={0}
+              y={0}
+              width={W}
+              height={H}
+              fit="cover"
+              opacity={alphaA}
+            />
+          ) : null}
+          {slotB ? (
+            <SkiaImage
+              image={slotB}
+              x={0}
+              y={0}
+              width={W}
+              height={H}
+              fit="cover"
+              opacity={alphaB}
+            />
+          ) : null}
+        </Canvas>
+      </View>
     </View>
   );
 }
+
+// ─── CharacterUnit — Pattern 3 ────────────────────────────────────────────────
+// Mirrors SharedCharacterAnimatedImageViewer (buggy version).
+
+interface CharacterUnitProps {
+  id: number;
+  shouldExit: boolean;
+  onExitComplete: (id: number) => void;
+  img: SkImage | null;
+}
+
+function CharacterUnit({
+  id,
+  shouldExit,
+  onExitComplete,
+  img,
+}: CharacterUnitProps) {
+  const opacity = useSharedValue(1);
+
+  useEffect(() => {
+    if (!shouldExit) {
+      opacity.value = withTiming(1, { duration: 200 });
+      return;
+    }
+    opacity.value = withTiming(
+      0,
+      { duration: CHAR_EXIT_DURATION },
+      finished => {
+        'worklet';
+        if (finished) scheduleOnRN(onExitComplete, id); // ← BUGGY
+      },
+    );
+  }, [shouldExit, opacity, onExitComplete, id]);
+
+  const W = 56;
+  const H = 72;
+  return (
+    <Canvas style={{ width: W, height: H }}>
+      {img ? (
+        <SkiaImage
+          image={img}
+          x={0}
+          y={0}
+          width={W}
+          height={H}
+          fit="cover"
+          opacity={opacity}
+        />
+      ) : null}
+    </Canvas>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+
+function App() {
+  const [running, setRunning] = useState(false);
+  const [scene, setScene] = useState(0);
+  const totalChars = CHARACTER_COUNT * 2;
+  const [exits, setExits] = useState<boolean[]>(
+    Array.from({ length: totalChars }, () => false),
+  );
+  const [images, setImages] = useState<[SkImage | null, SkImage | null]>([
+    null,
+    null,
+  ]);
+  const [status, setStatus] = useState('Loading images…');
+  const exitCount = useRef(0);
+
+  useEffect(() => {
+    Promise.all(IMAGE_URLS.map(fetchSkiaImage)).then(([a, b]) => {
+      setImages([a, b]);
+      setStatus(a && b ? 'Ready — tap Start' : 'Image load failed');
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setScene(s => s + 1), SCENE_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [running]);
+
+  useEffect(() => {
+    if (!running) return;
+    type TimerWithInner = ReturnType<typeof setTimeout> & {
+      _inner?: ReturnType<typeof setInterval>;
+    };
+    const timers: TimerWithInner[] = [];
+    for (let i = 0; i < totalChars; i++) {
+      let entering = false;
+      const tick = (idx: number) => {
+        entering = !entering;
+        setExits(prev => {
+          const n = [...prev];
+          n[idx] = !entering;
+          return n;
+        });
+      };
+      const t = setTimeout(() => {
+        tick(i);
+        (t as TimerWithInner)._inner = setInterval(
+          () => tick(i),
+          CHAR_CYCLE_MS,
+        );
+      }, i * STAGGER_MS) as TimerWithInner;
+      timers.push(t);
+    }
+    return () =>
+      timers.forEach(t => {
+        clearTimeout(t);
+        clearInterval(t._inner);
+      });
+  }, [running, totalChars]);
+
+  const onExitComplete = useCallback((_id: number) => {
+    exitCount.current += 1;
+  }, []);
+  const [imgA, imgB] = images;
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>scheduleOnRN-in-withTiming SIGABRT repro</Text>
+      <Text style={styles.sub}>
+        scene {scene} · exits {exitCount.current}
+      </Text>
+      <Text style={styles.hint}>{status}</Text>
+      <Pressable style={styles.btn} onPress={() => setRunning(r => !r)}>
+        <Text style={styles.btnText}>{running ? 'Stop' : 'Start'}</Text>
+      </Pressable>
+      {running ? (
+        <CrossfadeLayer
+          imageA={imgA}
+          imageB={imgB}
+          exitDuration={CROSSFADE_EXIT_DURATION_1}
+          label={`Pattern 1 — exit ${CROSSFADE_EXIT_DURATION_1}ms`}
+        />
+      ) : null}
+      {running ? (
+        <CrossfadeLayer
+          imageA={imgB}
+          imageB={imgA}
+          exitDuration={CROSSFADE_EXIT_DURATION_2}
+          label={`Pattern 2 — exit ${CROSSFADE_EXIT_DURATION_2}ms`}
+        />
+      ) : null}
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.grid}>
+        {Array.from({ length: totalChars }).map((_, i) => (
+          <CharacterUnit
+            key={i}
+            id={i}
+            shouldExit={exits[i] ?? false}
+            onExitComplete={onExitComplete}
+            img={i % 2 === 0 ? imgA : imgB}
+          />
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#16171A',
-    paddingTop: 80,
-    paddingHorizontal: 20,
+    paddingTop: 52,
+    paddingHorizontal: 12,
   },
-  title: {
-    color: '#F5F5F6',
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 20,
-  },
-  button: {
+  title: { color: '#F5F5F6', fontSize: 12, fontWeight: '600', marginBottom: 2 },
+  sub: { color: '#F5F5F6', fontSize: 12, marginBottom: 1 },
+  hint: { color: '#6b7280', fontSize: 10, marginBottom: 6 },
+  btn: {
     backgroundColor: '#3b82f6',
-    paddingVertical: 12,
+    paddingVertical: 8,
     paddingHorizontal: 16,
     borderRadius: 8,
-    marginBottom: 12,
+    marginBottom: 8,
+    alignSelf: 'flex-start',
   },
-  buttonText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  hint: {
-    color: '#9ca3af',
-    fontSize: 12,
-    marginTop: 8,
-    marginBottom: 20,
-  },
-  slot: {
-    minHeight: 200,
-  },
-  tooltip: {
-    width: 260,
-    backgroundColor: '#0B0B0D',
-    borderRadius: 12,
-    padding: 16,
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-    gap: 8,
-  },
-  label: {
-    color: '#F5F5F6',
-    fontSize: 14,
-  },
-  polygon: {
-    position: 'absolute',
-    right: 18,
-    top: -13,
-  },
-  canvas: {
-    width: 200,
-    height: 60,
-    marginTop: 8,
-  },
+  btnText: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  crossfadeWrap: { marginBottom: 6 },
+  label: { color: '#9ca3af', fontSize: 9, marginBottom: 2 },
+  scroll: { flex: 1 },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 3, paddingBottom: 16 },
 });
 
 export default App;

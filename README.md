@@ -1,53 +1,132 @@
-# react-native-reanimated SVG crash reproduction (RN 0.86)
+# `scheduleOnRN` inside `withTiming` callback — SIGABRT on Android (Reanimated 4.5.0 / Worklets 0.10.0)
 
-Minimal reproduction of a Reanimated 4.5.0 + react-native-svg crash on Android
-under React Native 0.86.0 with the New Architecture.
+Minimal reproduction of a use-after-free crash in `libworklets.so` when
+`scheduleOnRN` is called from inside a `withTiming` completion callback under
+concurrent Skia animation load.
 
 ## TL;DR
 
-Repeatedly mounting and unmounting an `<Animated.View>` subtree that contains
-multiple `react-native-svg` children (and a sibling `@shopify/react-native-skia`
-`<Canvas>`) while a `withTiming` animation is in flight produces:
+```ts
+opacity.value = withTiming(0, { duration: 700 }, (finished) => {
+  'worklet';
+  if (finished) {
+    scheduleOnRN(fn, arg);  // ← SIGABRT: Value::getObject assertion "isObject()" failed
+  }
+});
+```
 
-1. **Per-frame log spam (Symptom A):**
+When multiple concurrent Skia Canvas animations are running and `mqt_v_js` is
+under load, `Value::getObject` is called on a freed JSI value inside
+`CallInvoker::invokeAsync` → SIGABRT on `mqt_v_js`.
 
-   ```
-   W/Reanimated: synchronouslyUpdateUIProps failed for tag <N>
-   java.lang.reflect.InvocationTargetException
-     ... NativeProxy.synchronouslyUpdateUIProps(NativeProxy.kt:253)
-     ... NodesManager.onEventDispatch(NodesManager.kt:212)
-     ... FabricEventDispatcher.dispatchEvent
-     ... com.horcrux.svg.VirtualView.setClientRect(VirtualView.java:614)
-     ... com.horcrux.svg.SvgView.onDraw(SvgView.java:135)
-   Caused by: com.facebook.react.bridge.RetryableMountingLayerException:
-     Unable to find SurfaceMountingManager for tag: [N]
-     ... MountingManager.updatePropsSynchronously(MountingManager.kt:278)
-   ```
+## Backtrace (Android emulator, arm64, Android 16)
 
-   The same handful of SVG view tags loop-fail many times per frame.
+```
+pid: 8116, tid: 8155, name: mqt_v_js  >>> com.reanimatedsvgcrashrepro <<<
 
-2. **Eventual SIGABRT (Symptom B):**
+Abort message: '/…/jsi/jsi.h:2014: Object facebook::jsi::Value::getObject(IRuntime &) &&:
+               assertion "isObject()" failed'
 
-   ```
-   Abort message: jsi.h:2014: Object facebook::jsi::Value::getObject(IRuntime &) &&:
-     assertion "isObject()" failed
+backtrace:
+  #00 libc.so (abort+156)
+  #01 libc.so (__assert2+36)
+  #02 libworklets.so (facebook::jsi::Value::getObject(facebook::jsi::IRuntime&) &&+120)
+  #03 libworklets.so
+  #04 libworklets.so
+  #05 libworklets.so
+  #06 libworklets.so
+  #07 libworklets.so
+  #08 libworklets.so
+  #09 libworklets.so
+  #10 libworklets.so
+  #11 libworklets.so
+  #12 libworklets.so
+  #13 libworklets.so
+  #14 libworklets.so
+  #15 libreactnative.so
+  #16 libreactnative.so
+  #17 libreactnative.so (facebook::react::CallInvoker::invokeAsync(std::function<void ()>&&)::'lambda'(jsi::Runtime&)::operator()(jsi::Runtime&) const+24)
+  #18 libreactnative.so
+  #19 libreactnative.so
+  #20 libreactnative.so
+  #21 libreactnative.so
+  #22 libreactnative.so
+  #23 libreactnative.so
+  …
+  #31 libreactnative.so (facebook::react::Task::execute(jsi::Runtime&, bool)+412)
+  #32 libreactnative.so (facebook::react::RuntimeScheduler_Modern::executeTask(jsi::Runtime&, Task&, bool) const+116)
+  #33 libreactnative.so (facebook::react::RuntimeScheduler_Modern::runEventLoopTick(jsi::Runtime&, Task&)+204)
+  #34 libreactnative.so (facebook::react::RuntimeScheduler_Modern::runEventLoop(jsi::Runtime&)+140)
+  …
+  #54 libfbjni.so (facebook::jni::MethodWrapper<…JNativeRunnable::run()…>::dispatch+72)
+  #55 libfbjni.so (MethodWrapper dispatch)
+  #57 JIT — android.os.Handler.handleCallback
+  #58 JIT — android.os.Handler.dispatchMessage
+  …
+  #67 JIT — android.os.Looper.loopOnce
+  #68 JIT — android.os.Looper.loop
+```
 
-   backtrace:
-     #02 libworklets.so (facebook::jsi::Value::getObject+120)
-     #03–#09 libworklets.so
-     #17 libreactnative.so CallInvoker::invokeAsync(...)
-     #31 react::Task::execute
-     #32 RuntimeScheduler_Modern::executeTask
-   ```
+The crash occurs exclusively in the `mqt_v_js` thread inside the
+`invokeAsync` lambda posted by `scheduleOnRN`.
 
-PR [#9694](https://github.com/software-mansion/react-native-reanimated/pull/9694)
-(shipped in 4.5.0) wraps `MountingManager.updatePropsSynchronously` in a
-`try/catch` that swallows the per-frame failure. The catch hides the warning
-but does nothing to stop the upstream `svg.setClientRect → onEventDispatch`
-from being driven against tags whose surface is gone, and the spam appears to
-corrupt the worklets JSI value that later flows into `getObject()`.
+## Root cause analysis
 
-## Versions used
+`scheduleOnRN(fn, arg)` (called from a UI-thread worklet) posts a
+`JNativeRunnable` job to `mqt_v_js` that holds a JSI `Value` referencing `fn`.
+After the `withTiming` callback returns on the UI thread, the Reanimated
+animation engine frees the completion worklet's closure. The closure owns the
+JSI reference to `fn`. When the queued job finally executes on `mqt_v_js`,
+`Value::getObject()` is called on the freed reference → assertion failure →
+SIGABRT.
+
+This is a race between:
+
+- **Thread A** (UI thread): `withTiming` fires callback → `scheduleOnRN` posts
+  job → callback returns → worklet closure freed (JSI ref for `fn` freed).
+- **Thread B** (`mqt_v_js`): job dequeued → `getObject()` on freed `fn` → crash.
+
+The crash requires `mqt_v_js` to be under enough load that the job sits in the
+queue after the worklet closure is freed. With multiple concurrent Skia Canvas
+animations this load is easily reached.
+
+## The buggy pattern (three real locations in production code)
+
+All three patterns share the same structure:
+
+```ts
+// useSkiaCrossfadeTransition — exitingDuration = 700 ms
+alphaB.value = withTiming(0, { duration: 700 }, (finished) => {
+  'worklet';
+  if (finished) scheduleOnRN(setUrlB, null);  // ← UAF
+});
+
+// CrossfadeImage — exitingDuration = 600 ms
+alphaA.value = withTiming(0, { duration: 600 }, (finished) => {
+  'worklet';
+  if (finished) scheduleOnRN(setUrlA, null);  // ← UAF
+});
+
+// SharedCharacterAnimatedImageViewer — DURATION = 700 ms
+opacity.value = withTiming(0, { duration: 700 }, (finished) => {
+  'worklet';
+  if (finished) scheduleOnRN(onExitComplete, name);  // ← UAF
+});
+```
+
+## Fix applied in production
+
+Replace `scheduleOnRN` inside `withTiming` with a JS-thread `setTimeout`.
+`setTimeout`'s closure lives on the Hermes heap (a proper GC root) and is not
+subject to worklet-closure lifetime:
+
+```ts
+opacity.value = withTiming(0, { duration: DURATION });
+const timer = setTimeout(() => onExitComplete(name), DURATION);
+// cleanup: clearTimeout(timer) if component unmounts before timer fires
+```
+
+## Versions
 
 | Package | Version |
 |---|---|
@@ -55,47 +134,35 @@ corrupt the worklets JSI value that later flows into `getObject()`.
 | `react` | 19.2.3 |
 | `react-native-reanimated` | 4.5.0 |
 | `react-native-worklets` | 0.10.0 |
-| `react-native-svg` | 15.15.5 |
 | `@shopify/react-native-skia` | 2.6.6 |
+| Target: Android 16, arm64 (emulator + Samsung Galaxy S24) |
 
-New Architecture (Fabric) enabled — the RN 0.86 default.
+New Architecture (Fabric) enabled.
 
 ## Steps to reproduce
 
 ```bash
 # from this directory
 npm install
-cd android && ./gradlew clean && cd ..  # optional but recommended after fresh clone
 npx react-native start --reset-cache &
 npx react-native run-android
 ```
 
-1. Tap **Auto toggle 200ms** in the app. This mounts/unmounts the SVG-heavy
-   `<Animated.View>` subtree every 200 ms while a 150 ms `withTiming` is still
-   in flight.
-2. Within a few seconds you should see per-frame
-   `W/Reanimated: synchronouslyUpdateUIProps failed for tag <N>` warnings in
-   `adb logcat`.
-3. Within roughly 5–30 seconds the app should abort with the
-   `jsi.h:2014 isObject()` assertion in `libworklets.so`.
-
-To capture a logcat for an issue:
+1. Wait for the app to load — you should see 20 character images and a **Start** button.
+2. Tap **Start**.
+3. Three patterns run concurrently:
+   - **Pattern 1**: slot-A/B crossfade (exitingDuration=700 ms, URL cycles every 1000 ms).
+   - **Pattern 2**: slot-A/B crossfade (exitingDuration=600 ms, URL cycles every 1000 ms).
+   - **Pattern 3**: 20 independent character units, each fading out for 700 ms every 800 ms (staggered).
+4. The app crashes with the SIGABRT above within ~60 seconds on a stock Android emulator (Medium Phone API 36).
 
 ```bash
-adb logcat -c
-adb logcat > crash.logcat
-# now reproduce in the app, then Ctrl-C the logcat
+adb logcat -b crash > crash.logcat
 ```
 
-## Related upstream
+## Confirmed environments
 
-- Issue [#9681 — Reanimated animations freeze after first touch/tap (RN 0.86)](https://github.com/software-mansion/react-native-reanimated/issues/9681)
-- PR [#9694](https://github.com/software-mansion/react-native-reanimated/pull/9694)
-  shipped in 4.5.0 — adds a `try/catch` around the reflective
-  `updatePropsSynchronously` call. The current repro shows that the swallowed
-  exception loop produced by that catch still crashes the app via worklets'
-  JSI `getObject()` assertion.
-- Issue [#9636](https://github.com/software-mansion/react-native-reanimated/issues/9636)
-  / PR [#9649](https://github.com/software-mansion/react-native-reanimated/pull/9649)
-  — guarded the sibling `preserveMountedTags` path, but `synchronouslyUpdateUIProps`
-  was not given the same surface check.
+| Environment | Crash time |
+|---|---|
+| Android emulator (sdk_gphone64_arm64, Android 16, API 36) | ~60 s |
+| Samsung Galaxy S24 (SM-S921N, Android 16) | ~5 s (4–5 taps equivalent) |

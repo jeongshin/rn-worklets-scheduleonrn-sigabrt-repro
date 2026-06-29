@@ -1,5 +1,5 @@
 {
-  "name": "ReanimatedSvgCrashRepro",
+  "name": "WorkletsScheduleOnRNSigabrtRepro",
   "version": "0.0.1",
   "private": true,
   "scripts": {
@@ -10,10 +10,14 @@
     "test": "jest"
   },
   "dependencies": {
+    "@jeongshin/react-native-animateable-text": "^0.19.7-beta.0",
     "@shopify/react-native-skia": "2.6.6",
     "react": "19.2.3",
     "react-native": "0.86.0",
+    "react-native-gesture-handler": "^2.32.0",
     "react-native-reanimated": "4.5.0",
+    "react-native-safe-area-context": "^5.8.0",
+    "react-native-screens": "^4.25.2",
     "react-native-svg": "15.15.5",
     "react-native-worklets": "0.10.0"
   },
