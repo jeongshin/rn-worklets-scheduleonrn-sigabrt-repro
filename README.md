@@ -90,27 +90,27 @@ The crash requires `mqt_v_js` to be under enough load that the job sits in the
 queue after the worklet closure is freed. With multiple concurrent Skia Canvas
 animations this load is easily reached.
 
-## The buggy pattern (three real locations in production code)
+## The buggy pattern
 
-All three patterns share the same structure:
+All three concurrent patterns in the repro share the same structure:
 
 ```ts
-// useSkiaCrossfadeTransition — exitingDuration = 700 ms
+// Pattern 1 — crossfade slot A/B, exitDuration 700 ms
 alphaB.value = withTiming(0, { duration: 700 }, (finished) => {
   'worklet';
-  if (finished) scheduleOnRN(setUrlB, null);  // ← UAF
+  if (finished) scheduleOnRN(setSlotB, null);  // ← UAF
 });
 
-// CrossfadeImage — exitingDuration = 600 ms
+// Pattern 2 — crossfade slot A/B, exitDuration 600 ms
 alphaA.value = withTiming(0, { duration: 600 }, (finished) => {
   'worklet';
-  if (finished) scheduleOnRN(setUrlA, null);  // ← UAF
+  if (finished) scheduleOnRN(setSlotA, null);  // ← UAF
 });
 
-// SharedCharacterAnimatedImageViewer — DURATION = 700 ms
+// Pattern 3 — 20 independent character units, exitDuration 700 ms
 opacity.value = withTiming(0, { duration: 700 }, (finished) => {
   'worklet';
-  if (finished) scheduleOnRN(onExitComplete, name);  // ← UAF
+  if (finished) scheduleOnRN(onExitComplete, id);  // ← UAF
 });
 ```
 
